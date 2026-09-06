@@ -1304,7 +1304,9 @@ class HiRadixCache(RadixCache):
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         self._record_remove_event(node)
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
+        self.cache_controller.mem_pool_device_allocator.free_segment(
+            node.value, start_pos=0
+        )
         num_evicted = len(node.value)
         self._delete_leaf(node)
         return num_evicted
@@ -1334,7 +1336,9 @@ class HiRadixCache(RadixCache):
                 n.host_value = None
             if n.value is not None:
                 self._record_remove_event(n, medium=StorageMedium.GPU)
-                self.cache_controller.mem_pool_device_allocator.free(n.value)
+                self.cache_controller.mem_pool_device_allocator.free_segment(
+                    n.value, start_pos=0
+                )
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
                 n.value = None

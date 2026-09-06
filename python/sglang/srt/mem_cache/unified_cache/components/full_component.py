@@ -437,7 +437,7 @@ class FullComponent(TreeComponent):
                 if self.cache.is_swa_enabled:
                     alloc.full_attn_allocator.free(indices)
                 else:
-                    alloc.free(indices)
+                    alloc.free_segment(indices, start_pos=0)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"
