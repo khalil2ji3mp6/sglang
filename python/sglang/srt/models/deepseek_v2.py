@@ -1705,16 +1705,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
         # torch.npu.reset_stream_limit(torch.npu.current_stream())
+        '''
         _kv_pool = get_token_to_kv_pool()
         _counter = getattr(_kv_pool, "layer_transfer_counter", None)
         if _counter is not None:
             torch.npu.reset_stream_limit(torch.npu.current_stream())
             _counter.wait_for_prefetch(self.layer_id - _kv_pool.start_layer + 1)
+        '''
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-
+        
         if (
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
@@ -2878,13 +2880,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
-
+        '''
         _kv_pool = get_token_to_kv_pool()
         _counter = getattr(_kv_pool, "layer_transfer_counter", None)
         if _counter is not None and not self.is_layer_sparse:
             torch.npu.reset_stream_limit(torch.npu.current_stream())
             _counter.wait_for_prefetch(self.layer_id - _kv_pool.start_layer + 1)
-
+        '''
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
