@@ -59,6 +59,33 @@ logger = logging.getLogger(__name__)
 _ASCENDC_LAYER_GROUP_DEFAULT = 1
 
 
+_KV_EXCHANGE_META_HEADER = 8
+_KV_EXCHANGE_META_STRIDE = 9
+_KV_EXCHANGE_MAX_COMPONENTS = 4
+_KV_EXCHANGE_HOST_BASE_OFFSET = 1
+
+
+def _rewrite_host_base_to_dva(vals):
+    # D2H: copy meta to CPU so we can read/modify the int64 fields.
+    from memfabric_hybrid import offload
+    num_components = int(vals[0])
+    if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
+        raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
+    for c in range(num_components):
+        idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
+        host_base = int(vals[idx])
+        if host_base == 0:
+            continue
+        # get_dva_impl = offload.get_dva
+        dva = offload.get_dva(host_base)
+        if dva == 0:
+            raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
+        if dva != host_base:
+            vals[idx] = dva
+
+    return vals
+
+
 def _ascendc_layer_group_size() -> int:
     """Layer-group size for the AscendC sparse-copy pipeline (env-tunable)."""
     raw = os.environ.get("SGLANG_HICACHE_LAYER_GROUP_SIZE", "")
@@ -462,18 +489,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         from memfabric_hybrid import offload
 
         device = device_pool.k_buffer.device
-        # The kernel reads the token indices directly from device memory.
-        # Upload without a stream sync: a plain .to(device) from pageable
-        # memory synchronizes the stream and would serialize the pipeline.
-        if host_indices.device.type != "npu":
-            host_indices = to_device_no_sync(host_indices, device)
-        if device_indices.device.type != "npu":
-            device_indices = to_device_no_sync(device_indices, device)
-        # The kernel runs on the current (load) stream while the indices were
-        # allocated on another stream; keep them alive until the copy retires.
-        stream = torch.npu.current_stream()
-        host_indices.record_stream(stream)
-        device_indices.record_stream(stream)
+
+        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
+        if direction_value == 2:
+            if host_indices.device.type != "npu":
+                host_indices = to_device_no_sync(host_indices, device)
+            if device_indices.device.type != "npu":
+                device_indices = to_device_no_sync(device_indices, device)
+            stream = torch.npu.current_stream()
+            host_indices.record_stream(stream)
+            device_indices.record_stream(stream)
+        else:
+            if host_indices.device.type != "cpu":
+                host_indices = host_indices.cpu()
+            if device_indices.device.type != "cpu":
+                device_indices = device_indices.cpu()
 
         def comp_meta(dev_t, host_t, lo, hi):
             itemsize = dev_t.dtype.itemsize
@@ -573,8 +603,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
 
         num_pages = host_indices.numel() // self.page_size
-        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
-
         host_layout_mode = 1 if enable_layer_first else 0
 
         vals = [
@@ -590,37 +618,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         for comp in comps:
             vals.extend(comp)
         
-        def _rewrite_host_base_to_dva(vals):
-            _KV_EXCHANGE_META_HEADER = 8
-            _KV_EXCHANGE_META_STRIDE = 9
-            _KV_EXCHANGE_MAX_COMPONENTS = 4
-            _KV_EXCHANGE_HOST_BASE_OFFSET = 1
-
-            # D2H: copy meta to CPU so we can read/modify the int64 fields.
-            num_components = int(vals[0])
-            if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
-                raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
-            for c in range(num_components):
-                idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
-                host_base = int(vals[idx])
-                if host_base == 0:
-                    continue
-                # get_dva_impl = offload.get_dva
-                dva = offload.get_dva(host_base)
-                if dva == 0:
-                    raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
-                if dva != host_base:
-                    vals[idx] = dva
-
-            return vals
-
-        vals = _rewrite_host_base_to_dva(vals)
-
-        pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
-        meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
-        meta.copy_(pinned_meta, non_blocking=True)
-        track_pinned_staging(pinned_meta)
-        ret = offload.kv_exchange_copy(meta, device)
+        if direction_value == 2:
+            vals = _rewrite_host_base_to_dva(vals)
+            pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
+            meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
+            meta.copy_(pinned_meta, non_blocking=True)
+            track_pinned_staging(pinned_meta)
+        else:
+            meta = torch.tensor(vals, dtype=torch.int64)
+        ret = offload.kv_exchange_copy(meta, device, direction_value)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
