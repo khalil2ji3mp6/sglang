@@ -66,7 +66,9 @@ _KV_EXCHANGE_HOST_BASE_OFFSET = 1
 
 
 def _rewrite_host_base_to_dva(vals):
-    # D2H: copy meta to CPU so we can read/modify the int64 fields.
+    # MTE dereferences host memory through its device virtual address. The
+    # metadata is still assembled on the CPU, so rewrite its host pointers
+    # before uploading it to the device.
     from memfabric_hybrid import offload
     num_components = int(vals[0])
     if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
@@ -468,11 +470,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """One-shot KV transfer via the Memfabric acc_offload fused AIV kernel.
 
         Sends a compact metadata array (per-component layout pitches and
-        layer ranges) plus the device-resident token indices to the acc_offload
+        layer ranges) plus token indices to the acc_offload
         ``kv_exchange_copy`` kernel, which derives every (page, layer, split)
-        block address on the device: no (src, dst, len) entry table is built
-        on the host and the indices never round-trip through the CPU, so the
-        transfer launch does not synchronize the load stream.
+        block address without building a host-side (src, dst, len) table.
+
+        D2H and H2D layer group 0 use the device-resident MTE
+        path. Later H2D groups use the CPU-resident AICPU path.
 
         The layer range arguments restrict the transfer to one layer group
         (layer-group pipelining); the defaults transfer everything.
@@ -490,8 +493,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         device = device_pool.k_buffer.device
 
-        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
-        if direction_value == 2:
+        direction_value = (
+            direction.value
+            if isinstance(direction, TransferDirection)
+            else int(direction)
+        )
+        use_mte = direction_value == TransferDirection.D2H.value or (
+            direction_value == TransferDirection.H2D.value
+            and layer_start == 0
+        )
+        if use_mte:
             if host_indices.device.type != "npu":
                 host_indices = to_device_no_sync(host_indices, device)
             if device_indices.device.type != "npu":
@@ -618,7 +629,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         for comp in comps:
             vals.extend(comp)
         
-        if direction_value == 2:
+        if use_mte:
             vals = _rewrite_host_base_to_dva(vals)
             pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
             meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
@@ -626,7 +637,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             track_pinned_staging(pinned_meta)
         else:
             meta = torch.tensor(vals, dtype=torch.int64)
-        ret = offload.kv_exchange_copy(meta, device, direction_value)
+        # The metadata retains the actual copy direction (H2D=1, D2H=2).
+        # Select the device-meta MTE entry point with 2, including first-layer
+        # H2D; select the CPU-meta AICPU entry point with 1 for later H2D.
+        dispatch_mode = 2 if use_mte else 1
+        ret = offload.kv_exchange_copy(meta, device, dispatch_mode)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 

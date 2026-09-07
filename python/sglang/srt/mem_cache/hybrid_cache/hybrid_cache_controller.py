@@ -429,7 +429,7 @@ class HybridCacheController(BaseHiCacheController):
             resolved_pool_transfers = op.pool_transfers
         else:
             host_indices, device_indices, resolved_pool_transfers = (
-                self.move_hybrid_indices(op)
+                self.move_hybrid_indices(op, direction="d2h")
             )
         # Layer-first: sort indices by host slot so the kernel's peek-ahead
         # can detect contiguous runs.  GPU sort — no .cpu() sync.
@@ -570,7 +570,7 @@ class HybridCacheController(BaseHiCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
+            self.move_hybrid_indices(op, direction="h2d", layer_id=0)
         )
         # Layer-first: sort indices by host slot so the kernel's peek-ahead
         # can detect contiguous runs.  GPU sort — no .cpu() sync.
@@ -603,6 +603,7 @@ class HybridCacheController(BaseHiCacheController):
         self._prefetch_next_layer = 1
 
         with device_module.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
             if sort_event is not None:
                 sort_event.wait(self.load_stream)
             ack_start_event.record()
@@ -806,17 +807,27 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def move_hybrid_indices(
-        self, operation: CacheOperation
+        self,
+        operation: CacheOperation,
+        *,
+        direction: str = "h2d",
+        layer_id: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_indices, device_indices = self.move_indices(
-            operation.host_indices, operation.device_indices
+            operation.host_indices,
+            operation.device_indices,
+            direction=direction,
+            layer_id=layer_id,
         )
         resolved_pool_transfers = None
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
                 transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    direction=direction,
+                    layer_id=layer_id,
                 )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The

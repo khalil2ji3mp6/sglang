@@ -741,7 +741,9 @@ class HiCacheController:
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
             host_indices, device_indices = self.move_indices(
-                op.host_indices, op.device_indices
+                op.host_indices,
+                op.device_indices,
+                direction="d2h",
             )
         self.write_queue.clear()
 
@@ -808,7 +810,14 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+    def move_indices(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        *,
+        direction: str = "h2d",
+        layer_id: int = 0,
+    ):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -826,15 +835,20 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
-                # The fused acc_offload kv_exchange kernel reads the token
-                # indices directly on the device; keeping them there avoids
-                # the D2H sync that would serialize the layer-group pipeline.
-                # (The legacy memcpy2d exchange op still wants CPU indices and
-                # converts them itself.)
-                # Upload through pinned memory: host_indices comes from the
-                # radix-tree match as a pageable CPU tensor, and a pageable
-                # .to(device) completes with a stream synchronize that drains
-                # all compute queued on the current (default) stream.
+            if direction not in ("h2d", "d2h"):
+                raise ValueError(f"Unsupported transfer direction: {direction!r}")
+            if ascendc_io_enabled() and (direction == "d2h" or layer_id == 0):
+                # MTE reads the token indices directly on the device. Upload
+                # host indices through pinned memory so the copy is enqueued
+                # without synchronizing the current stream. D2H always uses
+                # MTE; H2D uses it for layer/group 0.
+                if host_indices.device.type != "npu":
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
+
+            # The AICPU and legacy memcpy2d paths read indices on the CPU.
+            if host_indices.device.type != "cpu":
+                host_indices = host_indices.cpu()
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
@@ -848,7 +862,10 @@ class HiCacheController:
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
+            op.host_indices,
+            op.device_indices,
+            direction="h2d",
+            layer_id=0,
         )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
